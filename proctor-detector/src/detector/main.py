@@ -10,11 +10,12 @@ import httpx
 from ultralytics import YOLO
 
 from .api_client import ApiClient
+from .behaviors import HeadTurnRule, Person, PhoneRule
 from .clips import resize_to_width, write_clip
 from .config import Settings
 from .stream import VideoStream
 
-PERSON, PHONE = 0, 67  # COCO class ids ("cell phone" = 67)
+PHONE = 67  # COCO "cell phone"
 
 
 @dataclass
@@ -24,23 +25,53 @@ class PendingClip:
     end_t: float
 
 
-def _center(b):
-    return (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+def extract_persons(res) -> list[Person]:
+    if res.boxes is None or len(res.boxes) == 0:
+        return []
+    boxes = res.boxes.xyxy.cpu().numpy()
+    ids = res.boxes.id.int().cpu().tolist() if res.boxes.id is not None else [None] * len(boxes)
+    kp = res.keypoints
+    kxy = kp.xy.cpu().numpy() if kp is not None and kp.xy is not None else None
+    kc = kp.conf.cpu().numpy() if kp is not None and kp.conf is not None else None
+    return [
+        Person(ids[i], b.tolist(), kxy[i] if kxy is not None else None, kc[i] if kc is not None else None)
+        for i, b in enumerate(boxes)
+    ]
 
 
-def assign_owner(phone_box, persons):
-    """Tracker id of the person this phone most likely belongs to (-1 if unknown)."""
-    cx, cy = _center(phone_box)
-    best_id, best_d = -1, math.inf
-    for pid, pb in persons:
-        pcx, pcy = _center(pb)
-        inside = pb[0] <= cx <= pb[2] and pb[1] <= cy <= pb[3]
-        d = math.hypot(cx - pcx, cy - pcy)
-        if not inside and d > (pb[3] - pb[1]):
+def extract_phones(res, min_conf: float) -> list[tuple[float, list]]:
+    return [(float(b.conf), b.xyxy[0].tolist()) for b in res.boxes if float(b.conf) >= min_conf]
+
+
+def _label(view, text, x, y, fs, color):
+    """Text on a solid dark box so it stays readable on any background."""
+    th = max(1, int(round(fs * 1.6)))
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    cv2.rectangle(view, (x - 4, y - h - 5), (x + w + 4, y + base + 3), (0, 0, 0), -1)
+    cv2.putText(view, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, color, th, cv2.LINE_AA)
+
+
+def draw_status(view, persons, phones, head_rule, seconds_needed):
+    """Overlay live detector state so you can see WHY something is or isn't flagged."""
+    fs = max(0.6, view.shape[1] / 1500)
+    for p in persons:
+        if p.id is None:
             continue
-        if d < best_d:
-            best_id, best_d = (pid if pid is not None else -1), d
-    return best_id
+        d = head_rule.debug.get(p.id) if head_rule is not None else None
+        if d is None:
+            continue
+        if d["turn"] is None:
+            text, color = "no face points", (200, 200, 200)
+        elif d["nbr"] is None:
+            text, color = f"head {d['turn']:+.2f} (not turned)", (255, 255, 255)
+        elif not d["nbr"]:
+            text, color = f"head {d['turn']:+.2f} TURNED, no neighbour there", (0, 220, 255)
+        else:
+            text, color = f"head {d['turn']:+.2f} -> NEIGHBOUR {d['held']:.1f}/{seconds_needed:.0f}s", (0, 255, 0)
+        x, y = int(p.box[0]) + 6, int(p.box[1]) + int(48 * fs) + 14
+        _label(view, text, x, y, fs, color)
+    banner = f"people: {len(persons)}   phones: {len(phones)}"
+    _label(view, banner, 10, int(30 * fs) + 10, fs, (255, 255, 255))
 
 
 def finish_clip(pc: PendingClip, api: ApiClient) -> None:
@@ -63,16 +94,25 @@ def finish_clip(pc: PendingClip, api: ApiClient) -> None:
 
 def run(s: Settings) -> None:
     stream = VideoStream(s.source)
-    model = YOLO(s.model)
     api = ApiClient(s.api_url, s.api_key)
+    pose_model = YOLO(s.pose_model)
+    phone_model = YOLO(s.model) if s.enable_phone else None
 
-    buffer: deque = deque()            # (t, small_frame) covering the last pre_seconds
-    hits: dict[int, deque] = {}        # owner id -> recent "phone seen" flags
-    last_alert: dict[int, float] = {}  # owner id -> time of last alert
+    rules, cooldowns = [], {}
+    if s.enable_phone:
+        rules.append(PhoneRule(s))
+        cooldowns["phone"] = s.cooldown_seconds
+    if s.enable_head_turn:
+        rules.append(HeadTurnRule(s))
+        cooldowns["looking_at_neighbor"] = s.head_cooldown_seconds
+
+    buffer: deque = deque()                       # (t, small_frame) for the last pre_seconds
+    last_alert: dict[tuple, float] = {}           # (behavior, owner) -> time of last alert
     pending: list[PendingClip] = []
     t0, idx = None, 0
 
-    print(f"Running on {s.source} (live={stream.live}), session {s.session_id}. Ctrl+C to stop.")
+    print(f"Running on {s.source} (live={stream.live}), session {s.session_id}. "
+          f"Rules: {[r.behavior for r in rules]}. Ctrl+C to stop.")
     try:
         while True:
             item = stream.read()
@@ -95,53 +135,49 @@ def run(s: Settings) -> None:
             if idx % s.frame_skip:
                 continue
 
-            res = model.track(
-                frame, persist=True, tracker="bytetrack.yaml", classes=[PERSON, PHONE],
-                conf=0.25, imgsz=s.imgsz, device=s.device, verbose=False,
+            pose_res = pose_model.track(
+                frame, persist=True, tracker="bytetrack.yaml", conf=0.3,
+                imgsz=s.imgsz, device=s.device, verbose=False,
             )[0]
+            persons = extract_persons(pose_res)
 
-            persons, phones = [], []
-            for b in res.boxes:
-                cls, conf = int(b.cls), float(b.conf)
-                box = b.xyxy[0].tolist()
-                tid = int(b.id) if b.id is not None else None
-                if cls == PERSON:
-                    persons.append((tid, box))
-                elif cls == PHONE and conf >= s.phone_conf:
-                    phones.append((conf, box))
+            phones = []
+            if phone_model is not None:
+                phone_res = phone_model.predict(
+                    frame, classes=[PHONE], conf=0.25, imgsz=s.imgsz, device=s.device, verbose=False
+                )[0]
+                phones = extract_phones(phone_res, s.phone_conf)
 
-            seen: dict[int, tuple[float, list]] = {}
-            for conf, box in phones:
-                owner = assign_owner(box, persons)
-                if owner not in seen or conf > seen[owner][0]:
-                    seen[owner] = (conf, box)
-
-            for owner in seen:
-                hits.setdefault(owner, deque(maxlen=s.window_frames))
-            for owner, window in list(hits.items()):
-                window.append(owner in seen)
-                if len(window) == window.maxlen and not any(window):
-                    del hits[owner]
-                    continue
-                if sum(window) >= s.confirm_frames and t - last_alert.get(owner, -math.inf) >= s.cooldown_seconds:
-                    last_alert[owner] = t
-                    conf, box = seen.get(owner, (0.0, []))
-                    print(f"[{t - t0:7.1f}s] PHONE flagged (student track {owner}, conf {conf:.2f})")
+            for rule in rules:
+                for ev in rule.update(t, persons, phones):
+                    key = (ev.behavior, ev.owner)
+                    if t - last_alert.get(key, -math.inf) < cooldowns[ev.behavior]:
+                        continue
+                    last_alert[key] = t
+                    print(f"[{t - t0:7.1f}s] {ev.behavior.upper()} flagged "
+                          f"(student track {ev.owner}, score {ev.conf:.2f}) {ev.details}")
                     try:
                         alert = api.create_alert({
                             "session_id": s.session_id,
-                            "track_id": owner if owner != -1 else None,
-                            "behavior_type": "phone",
-                            "confidence": round(conf, 3),
+                            "track_id": ev.owner if ev.owner != -1 else None,
+                            "behavior_type": ev.behavior,
+                            "confidence": round(min(1.0, ev.conf), 3),
                             "video_ts_seconds": round(t - t0, 2),
-                            "details": {"bbox": [round(v, 1) for v in box], "frames_hit": int(sum(window))},
+                            "details": ev.details,
                         })
                         pending.append(PendingClip(alert["id"], list(buffer), t + s.post_seconds))
                     except httpx.HTTPError as e:
                         print(f"  failed to send alert: {e}")
 
             if s.show:
-                cv2.imshow("proctor-detector", resize_to_width(res.plot(), 1280))
+                view = pose_res.plot()
+                for conf, (x1, y1, x2, y2) in phones:
+                    cv2.rectangle(view, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+                    cv2.putText(view, f"phone {conf:.2f}", (int(x1), int(y1) - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                head_rule = next((r for r in rules if isinstance(r, HeadTurnRule)), None)
+                draw_status(view, persons, phones, head_rule, s.head_turn_seconds)
+                cv2.imshow("proctor-detector", resize_to_width(view, 1280))
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     except KeyboardInterrupt:
@@ -154,7 +190,7 @@ def run(s: Settings) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Exam hall phone detector")
+    p = argparse.ArgumentParser(description="Exam hall cheating detector")
     p.add_argument("--source", help="rtsp url, video file, or webcam index")
     p.add_argument("--session", type=int, help="exam session id from the backend")
     p.add_argument("--show", action="store_true", help="display annotated video")

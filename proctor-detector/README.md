@@ -51,3 +51,16 @@ makes detection reliable.
 - 1080p minimum; 4K cameras help a lot for the back rows.
 - Even lighting, no bright windows in the frame.
 - Speed: use a GPU (`DEVICE=0`). On CPU, raise `FRAME_SKIP` or lower `IMGSZ`.
+
+## Behaviours detected
+| Behaviour | How |
+|---|---|
+| `phone` | YOLO COCO "cell phone", confirmed over several frames, assigned to the nearest student |
+| `looking_at_neighbor` | YOLO-pose face keypoints give a head-turn estimate; flagged if the head stays turned for `HEAD_TURN_SECONDS` **toward a student sitting beside them** (same row, close) |
+
+Turn a rule off with `ENABLE_PHONE=false` / `ENABLE_HEAD_TURN=false`.
+
+### Tuning head-turn
+Run with `--show` and look at the skeleton overlay. If you get false flags, raise `HEAD_TURN_RATIO` (0.8 ~ 45 degrees)
+or `HEAD_TURN_SECONDS`. If it misses real cases, lower them. This is a heuristic: it needs faces large enough for
+the model to find the eyes, so back rows of a big hall may need a higher-resolution camera.
